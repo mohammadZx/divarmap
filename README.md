@@ -54,6 +54,25 @@ php divar_map_collect.php example_initial_request.json out.json \
 
 در PHP آرایه‌ها **کپی سطحی** می‌شوند؛ بدون `deep_copy_array` همهٔ شاخه‌های بازگشتی همان bbox را روی یک آبجکت مشترک می‌نوشتند و نتیجه غلط یا تکراری می‌شد. الان هر سلول قبل از تغییر bbox عمیق کپی می‌شود.
 
+## خطای `Parse error: Unmatched '}'`
+
+اگر این خطا را می‌بینید، معمولاً فایل **`divar_map_collect.php` قدیمی یا دست‌خورده** است (یک `}` اضافه یا کم).
+
+1. آخرین نسخه را از **`main`** بگیرید: `git pull` یا دانلود مجدد ZIP از GitHub.
+2. چک کنید:
+
+```bash
+php -l divar_map_collect.php
+```
+
+باید بنویسد `No syntax errors`.
+
+3. یا از همین ریپو:
+
+```bash
+php tools/check_braces.php divar_map_collect.php
+```
+
 ## هشدار
 
 استفادهٔ خودکار از API دیوار ممکن است با محدودیت نرخ یا شرایط استفاده مغایرت داشته باشد؛ مسئولیت با خود کاربر است.
