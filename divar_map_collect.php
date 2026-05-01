@@ -17,6 +17,7 @@
  *   --quiet            بدون چاپ روی stderr (فقط فایل لاگ اگر فعال باشد)
  *   --max-requests=N   حداکثر تعداد درخواست HTTP (ایمنی؛ پیش‌فرض 5000)
  *   --timeout-sec=N    تایم‌اوت هر درخواست (پیش‌فرض 60)
+ *   --max-runtime-sec=N حداکثر زمان کل اجرا به ثانیه (۰ = نامحدود). مثال: ۶۰ = یک دقیقه زوم/کاور
  *   --try-pagination   صفحه‌بندی آزمایشی با pagination پاسخ
  *   --paginate-max=N   حداکثر صفحات اضافه در هر سلول (پیش‌فرض 30)
  */
@@ -24,6 +25,12 @@
 declare(strict_types=1);
 
 const DEFAULT_ENDPOINT = 'https://api.divar.ir/v8/postlist/w/search';
+
+/** مهلت زمانی با microtime(true)؛ null یعنی بدون محدودیت */
+function is_runtime_deadline_passed(?float $deadlineMono): bool
+{
+    return $deadlineMono !== null && microtime(true) >= $deadlineMono;
+}
 
 /**
  * کپی عمیق آرایه — بدون این، در PHP کپی سطحی است و bbox تمام شاخه‌های بازگشتی
@@ -494,11 +501,23 @@ function fetch_extra_pages(
     int $paginateMax,
     ?RunLogger $logger,
     int &$globalRequestCount,
-    int $maxRequests
+    int $maxRequests,
+    ?float $deadlineMono,
+    array &$ctx
 ): array {
     $pages = [];
     $resp = $firstResponse;
     for ($p = 0; $p < $paginateMax; $p++) {
+        if (is_runtime_deadline_passed($deadlineMono)) {
+            if ($logger !== null) {
+                $logger->logEvent('pagination_stopped_max_runtime', ['requests_so_far' => $globalRequestCount]);
+            }
+            if (($ctx['stop_reason'] ?? null) === null) {
+                $ctx['stop_reason'] = 'max_runtime';
+            }
+            break;
+        }
+
         $pag = $resp['pagination'] ?? null;
         if (!is_array($pag) || empty($pag['has_next_page'])) {
             break;
@@ -523,6 +542,16 @@ function fetch_extra_pages(
         ];
 
         usleep($sleepUs);
+        if (is_runtime_deadline_passed($deadlineMono)) {
+            if ($logger !== null) {
+                $logger->logEvent('pagination_stopped_max_runtime_after_sleep', ['requests_so_far' => $globalRequestCount]);
+            }
+            if (($ctx['stop_reason'] ?? null) === null) {
+                $ctx['stop_reason'] = 'max_runtime';
+            }
+            break;
+        }
+
         $globalRequestCount++;
         $got = http_post_json($url, $nextBody, $extraHeaders, $timeoutSec, $logger, $globalRequestCount);
         $pages[] = $got['json'];
@@ -557,6 +586,22 @@ function merge_responses_into(array &$accumPosts, array $extraResponses): void
  */
 function crawl_quad(array &$ctx, array &$accumPosts): void
 {
+    $deadlineMono = $ctx['deadline_mono'] ?? null;
+    if (is_runtime_deadline_passed($deadlineMono)) {
+        if ($ctx['logger'] ?? null) {
+            /** @var RunLogger $lg */
+            $lg = $ctx['logger'];
+            $lg->logEvent('crawl_skip_max_runtime', [
+                'depth' => $ctx['depth'] ?? -1,
+                'elapsed_sec' => isset($ctx['run_started_mono']) ? round(microtime(true) - (float) $ctx['run_started_mono'], 3) : null,
+            ]);
+        }
+        if (($ctx['stop_reason'] ?? null) === null) {
+            $ctx['stop_reason'] = 'max_runtime';
+        }
+        return;
+    }
+
     $url = $ctx['url'];
     /** @var array<string, mixed> $templateBody */
     $templateBody = $ctx['templateBody'];
@@ -576,6 +621,7 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
     $logger = $ctx['logger'];
     $timeoutSec = $ctx['timeoutSec'];
     $maxRequests = $ctx['maxRequests'];
+    $deadlineMono = $ctx['deadline_mono'] ?? null;
 
     /** @var int $globalRequestCount */
     $globalRequestCount = &$ctx['globalRequestCount'];
@@ -592,6 +638,19 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
     if ($globalRequestCount >= $maxRequests) {
         if ($logger !== null) {
             $logger->logEvent('crawl_skip_max_requests', ['depth' => $depth, 'count' => $globalRequestCount]);
+        }
+        if (($ctx['stop_reason'] ?? null) === null) {
+            $ctx['stop_reason'] = 'max_requests';
+        }
+        return;
+    }
+
+    if (is_runtime_deadline_passed($deadlineMono)) {
+        if ($logger !== null) {
+            $logger->logEvent('crawl_skip_max_runtime_before_request', ['depth' => $depth]);
+        }
+        if (($ctx['stop_reason'] ?? null) === null) {
+            $ctx['stop_reason'] = 'max_runtime';
         }
         return;
     }
@@ -611,6 +670,16 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
     }
 
     usleep($sleepUs);
+    if (is_runtime_deadline_passed($deadlineMono)) {
+        if ($logger !== null) {
+            $logger->logEvent('crawl_skip_max_runtime_after_sleep', ['depth' => $depth]);
+        }
+        if (($ctx['stop_reason'] ?? null) === null) {
+            $ctx['stop_reason'] = 'max_runtime';
+        }
+        return;
+    }
+
     $globalRequestCount++;
     $pack = http_post_json($url, $body, $extraHeaders, $timeoutSec, $logger, $globalRequestCount);
     /** @var array<string, mixed> $json */
@@ -642,7 +711,9 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
             $paginateMax,
             $logger,
             $globalRequestCount,
-            $maxRequests
+            $maxRequests,
+            $deadlineMono,
+            $ctx
         );
         merge_responses_into($accumPosts, $extras);
         if ($logger !== null) {
@@ -668,6 +739,16 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
         return;
     }
 
+    if (is_runtime_deadline_passed($deadlineMono)) {
+        if ($logger !== null) {
+            $logger->logEvent('crawl_skip_split_max_runtime', ['depth' => $depth, 'would_have_split' => true]);
+        }
+        if (($ctx['stop_reason'] ?? null) === null) {
+            $ctx['stop_reason'] = 'max_runtime';
+        }
+        return;
+    }
+
     $midLon = ($minLon + $maxLon) / 2.0;
     $midLat = ($minLat + $maxLat) / 2.0;
 
@@ -679,6 +760,16 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
     ];
 
     foreach ($quads as $qi => $q) {
+        if (is_runtime_deadline_passed($deadlineMono)) {
+            if ($logger !== null) {
+                $logger->logEvent('crawl_stop_children_max_runtime', ['parent_depth' => $depth, 'child_index_skipped_from' => $qi]);
+            }
+            if (($ctx['stop_reason'] ?? null) === null) {
+                $ctx['stop_reason'] = 'max_runtime';
+            }
+            break;
+        }
+
         [$w, $s, $e, $n] = $q;
         $child = $ctx;
         $child['minLon'] = $w;
@@ -737,6 +828,7 @@ function main(array $argv): int
     $quiet = false;
     $maxRequests = 5000;
     $timeoutSec = 60;
+    $maxRuntimeSec = 0;
 
     foreach ($argv as $arg) {
         if (str_starts_with($arg, '--max-depth=')) {
@@ -763,8 +855,13 @@ function main(array $argv): int
             $maxRequests = max(1, (int) substr($arg, strlen('--max-requests=')));
         } elseif (str_starts_with($arg, '--timeout-sec=')) {
             $timeoutSec = max(5, (int) substr($arg, strlen('--timeout-sec=')));
+        } elseif (str_starts_with($arg, '--max-runtime-sec=')) {
+            $maxRuntimeSec = max(0, (int) substr($arg, strlen('--max-runtime-sec=')));
         }
     }
+
+    $runStartedMono = microtime(true);
+    $deadlineMono = $maxRuntimeSec > 0 ? $runStartedMono + $maxRuntimeSec : null;
 
     if (!is_readable($inPath)) {
         fwrite(STDERR, "فایل ورودی خوانا نیست: {$inPath}\n");
@@ -814,6 +911,8 @@ function main(array $argv): int
             'try_pagination' => $tryPagination,
             'max_requests' => $maxRequests,
             'timeout_sec' => $timeoutSec,
+            'max_runtime_sec' => $maxRuntimeSec > 0 ? $maxRuntimeSec : null,
+            'deadline_mono' => $deadlineMono,
             'curl_available' => extension_loaded('curl'),
             'allow_url_fopen' => filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN),
             'php_version' => PHP_VERSION,
@@ -846,10 +945,14 @@ function main(array $argv): int
         'timeoutSec' => $timeoutSec,
         'maxRequests' => $maxRequests,
         'globalRequestCount' => 0,
+        'deadline_mono' => $deadlineMono,
+        'run_started_mono' => $runStartedMono,
+        'stop_reason' => null,
     ];
 
     if (!$quiet) {
-        fwrite(STDERR, "شروع جمع‌آوری — bbox: [{$minLon}, {$minLat}, {$maxLon}, {$maxLat}] depth≤{$maxDepth}\n");
+        $rtMsg = $deadlineMono !== null ? ' — حداکثر زمان اجرا: ' . $maxRuntimeSec . 's' : '';
+        fwrite(STDERR, "شروع جمع‌آوری — bbox: [{$minLon}, {$minLat}, {$maxLon}, {$maxLat}] depth≤{$maxDepth}{$rtMsg}\n");
         if ($logger !== null) {
             fwrite(STDERR, "لاگ جزئیات: {$logFile}\n");
         }
@@ -865,10 +968,15 @@ function main(array $argv): int
         return 1;
     }
 
-    if ($logger !== null) {
+    if (($ctx['stop_reason'] ?? null) === null) {
+        $ctx['stop_reason'] = 'complete';
+    }
         $logger->logEvent('run_end', [
             'http_requests' => $ctx['globalRequestCount'],
             'unique_posts' => count($accum),
+            'elapsed_wall_sec' => round(microtime(true) - $runStartedMono, 3),
+            'stop_reason' => $ctx['stop_reason'],
+            'max_runtime_sec' => $maxRuntimeSec > 0 ? $maxRuntimeSec : null,
         ]);
     }
 
@@ -878,6 +986,9 @@ function main(array $argv): int
             'bbox' => ['min_lon' => $minLon, 'min_lat' => $minLat, 'max_lon' => $maxLon, 'max_lat' => $maxLat],
             'unique_posts' => count($accum),
             'http_requests' => $ctx['globalRequestCount'],
+            'elapsed_wall_sec' => round(microtime(true) - $runStartedMono, 3),
+            'stop_reason' => $ctx['stop_reason'],
+            'max_runtime_sec' => $maxRuntimeSec > 0 ? $maxRuntimeSec : null,
             'collected_at' => gmdate('c'),
         ],
         'tokens' => array_keys($accum),
@@ -896,7 +1007,9 @@ function main(array $argv): int
     }
 
     if (!$quiet) {
-        fwrite(STDERR, 'تمام — درخواست‌ها: ' . $ctx['globalRequestCount'] . ' — آگهی یکتا: ' . count($accum) . " → {$outPath}\n");
+        $reason = $ctx['stop_reason'] !== null ? ' — توقف: ' . $ctx['stop_reason'] : '';
+        fwrite(STDERR, 'تمام — زمان wall: ' . round(microtime(true) - $runStartedMono, 2) . 's — درخواست‌ها: '
+            . $ctx['globalRequestCount'] . ' — آگهی یکتا: ' . count($accum) . $reason . " → {$outPath}\n");
     }
     return 0;
 }

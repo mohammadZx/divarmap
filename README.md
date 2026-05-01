@@ -23,6 +23,20 @@ php divar_map_collect.php my_body.json out.json --cookie-file=cookies.txt
 
 گزینهٔ `--try-pagination` صفحهٔ بعد را با فیلدهای `pagination` پاسخ امتحان می‌کند؛ اگر سرور بدنهٔ دیگری بخواهد، باید از DevTools همان درخواست را ضبط کنید.
 
+### محدودیت زمان اجرا (کاور تا سقف زمان)
+
+برای مثال **فقط یک دقیقه** زوم/تقسیم و جمع‌آوری، بدون اینکه تا عمق کامل برود:
+
+```bash
+php divar_map_collect.php example_initial_request.json out.json \
+  --max-runtime-sec=60 \
+  --max-depth=12 \
+  --sleep-ms=100
+```
+
+- `--max-runtime-sec=0` (پیش‌فرض) یعنی بدون محدودیت زمانی تا زمانی که `max-depth` یا `max-requests` برسد.
+- هنگام رسیدن به مهلت، کراول متوقف می‌شود؛ در `meta.stop_reason` مقدار `max_runtime` و در `meta.elapsed_wall_sec` زمان واقعی wall-clock ذخیره می‌شود.
+
 ### لاگ دیباگ (ریکوئست / ریسپانس هر مرحله)
 
 به‌صورت پیش‌فرض کنار فایل خروجی، فایل `*.collect.log` ساخته می‌شود و شامل:
