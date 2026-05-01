@@ -20,6 +20,9 @@
  *   --max-runtime-sec=N حداکثر زمان کل اجرا به ثانیه (۰ = نامحدود). مثال: ۶۰ = یک دقیقه زوم/کاور
  *   --try-pagination   صفحه‌بندی آزمایشی با pagination پاسخ
  *   --paginate-max=N   حداکثر صفحات اضافه در هر سلول (پیش‌فرض 30)
+ *   --lite              فقط خلاصهٔ همان نتیجهٔ سرچ (عنوان، تصویر، توضیح کوتاه، منطقه…)
+ *                       بدون raw_post_row؛ برای کم‌حجم‌تر و بدون «خزیدن» جزئیات اضافه
+ *   --search-summary-only  همان --lite
  */
 
 declare(strict_types=1);
@@ -451,7 +454,7 @@ function set_zoom_in_body($body, float $zoom)
 }
 
 /** @return array<string, array<string, mixed>> */
-function extract_posts_from_list_widgets(?array $listWidgets): array
+function extract_posts_from_list_widgets(?array $listWidgets, bool $lite = false): array
 {
     $out = [];
     if ($listWidgets === null) {
@@ -474,15 +477,18 @@ function extract_posts_from_list_widgets(?array $listWidgets): array
         if ($token === null || $token === '') {
             continue;
         }
-        $out[$token] = [
+        $row = [
             'token' => $token,
             'title' => $data['title'] ?? null,
             'middle_description_text' => $data['middle_description_text'] ?? null,
             'bottom_description_text' => $data['bottom_description_text'] ?? null,
             'image_url' => $data['image_url'] ?? null,
             'web_info' => $data['action']['payload']['web_info'] ?? null,
-            'raw_post_row' => $data,
         ];
+        if (!$lite) {
+            $row['raw_post_row'] = $data;
+        }
+        $out[$token] = $row;
     }
     return $out;
 }
@@ -564,7 +570,7 @@ function fetch_extra_pages(
  * @param array<string, mixed> $accumPosts
  * @param array<int|string, mixed> $extraResponses
  */
-function merge_responses_into(array &$accumPosts, array $extraResponses): void
+function merge_responses_into(array &$accumPosts, array $extraResponses, bool $lite): void
 {
     foreach ($extraResponses as $jr) {
         if (!is_array($jr)) {
@@ -574,7 +580,7 @@ function merge_responses_into(array &$accumPosts, array $extraResponses): void
         if (!is_array($lw)) {
             continue;
         }
-        foreach (extract_posts_from_list_widgets($lw) as $tok => $row) {
+        foreach (extract_posts_from_list_widgets($lw, $lite) as $tok => $row) {
             $accumPosts[$tok] = $row;
         }
     }
@@ -622,6 +628,7 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
     $timeoutSec = $ctx['timeoutSec'];
     $maxRequests = $ctx['maxRequests'];
     $deadlineMono = $ctx['deadline_mono'] ?? null;
+    $lite = !empty($ctx['lite']);
 
     /** @var int $globalRequestCount */
     $globalRequestCount = &$ctx['globalRequestCount'];
@@ -685,7 +692,7 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
     /** @var array<string, mixed> $json */
     $json = $pack['json'];
 
-    $fromMain = extract_posts_from_list_widgets($json['list_widgets'] ?? null);
+    $fromMain = extract_posts_from_list_widgets($json['list_widgets'] ?? null, $lite);
     $beforeCount = count($accumPosts);
     foreach ($fromMain as $tok => $row) {
         $accumPosts[$tok] = $row;
@@ -715,7 +722,7 @@ function crawl_quad(array &$ctx, array &$accumPosts): void
             $deadlineMono,
             $ctx
         );
-        merge_responses_into($accumPosts, $extras);
+        merge_responses_into($accumPosts, $extras, $lite);
         if ($logger !== null) {
             $logger->logEvent('crawl_cell_after_pagination', [
                 'depth' => $depth,
@@ -829,6 +836,7 @@ function main(array $argv): int
     $maxRequests = 5000;
     $timeoutSec = 60;
     $maxRuntimeSec = 0;
+    $lite = false;
 
     foreach ($argv as $arg) {
         if (str_starts_with($arg, '--max-depth=')) {
@@ -857,6 +865,8 @@ function main(array $argv): int
             $timeoutSec = max(5, (int) substr($arg, strlen('--timeout-sec=')));
         } elseif (str_starts_with($arg, '--max-runtime-sec=')) {
             $maxRuntimeSec = max(0, (int) substr($arg, strlen('--max-runtime-sec=')));
+        } elseif ($arg === '--lite' || $arg === '--search-summary-only') {
+            $lite = true;
         }
     }
 
@@ -917,6 +927,7 @@ function main(array $argv): int
             'allow_url_fopen' => filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN),
             'php_version' => PHP_VERSION,
             'log_file' => $logFile,
+            'lite_search_summary_only' => $lite,
         ]);
     } elseif ($quiet === false && $noLogFile) {
         fwrite(STDERR, "[hint] لاگ فایل با --no-log-file خاموش است؛ برای ذخیرهٔ ریکوئست/ریسپانس هر مرحله آن را بردارید یا --log-file=PATH بدهید.\n");
@@ -948,6 +959,7 @@ function main(array $argv): int
         'deadline_mono' => $deadlineMono,
         'run_started_mono' => $runStartedMono,
         'stop_reason' => null,
+        'lite' => $lite,
     ];
 
     if (!$quiet) {
@@ -978,6 +990,7 @@ function main(array $argv): int
             'elapsed_wall_sec' => round(microtime(true) - $runStartedMono, 3),
             'stop_reason' => $ctx['stop_reason'],
             'max_runtime_sec' => $maxRuntimeSec > 0 ? $maxRuntimeSec : null,
+            'lite' => $lite,
         ]);
     }
 
@@ -990,6 +1003,7 @@ function main(array $argv): int
             'elapsed_wall_sec' => round(microtime(true) - $runStartedMono, 3),
             'stop_reason' => $ctx['stop_reason'],
             'max_runtime_sec' => $maxRuntimeSec > 0 ? $maxRuntimeSec : null,
+            'lite_search_summary_only' => $lite,
             'collected_at' => gmdate('c'),
         ],
         'tokens' => array_keys($accum),

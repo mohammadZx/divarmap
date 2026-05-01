@@ -37,6 +37,24 @@ php divar_map_collect.php example_initial_request.json out.json \
 - `--max-runtime-sec=0` (پیش‌فرض) یعنی بدون محدودیت زمانی تا زمانی که `max-depth` یا `max-requests` برسد.
 - هنگام رسیدن به مهلت، کراول متوقف می‌شود؛ در `meta.stop_reason` مقدار `max_runtime` و در `meta.elapsed_wall_sec` زمان واقعی wall-clock ذخیره می‌شود.
 
+### فقط خلاصهٔ نتیجهٔ سرچ (بدون `raw_post_row`)
+
+API همان **لیست جست‌وجو** را برمی‌گرداند؛ اسکریپت به‌طور پیش‌فرض کل آبجکت ردیف (`raw_post_row`) را هم ذخیره می‌کند. برای **فقط فیلدهای کوتاه** (عنوان، تصویر، قیمت/توضیح میانی، زمان/محله، `web_info`):
+
+```bash
+php divar_map_collect.php body.json out.json --lite
+```
+
+یا معادل: `--search-summary-only`
+
+برای **حداکثر ۶ درخواست HTTP** و همچنان تقسیم نقشه تا عمق ۶ (بعد از ۶ درخواست متوقف می‌شود):
+
+```bash
+php divar_map_collect.php body.json out.json --lite --max-depth=6 --max-requests=6
+```
+
+در `meta` فیلد **`lite_search_summary_only`: true** ثبت می‌شود.
+
 ### لاگ دیباگ (ریکوئست / ریسپانس هر مرحله)
 
 به‌صورت پیش‌فرض کنار فایل خروجی، فایل `*.collect.log` ساخته می‌شود و شامل:
