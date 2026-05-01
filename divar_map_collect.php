@@ -3,36 +3,144 @@
 /**
  * جمع‌آوری آگهی‌های نقشهٔ دیوار برای یک bbox اولیه (pure PHP، بدون Composer).
  *
- * تحلیل کوتاه درخواست/پاسخ:
- * - بدنهٔ POST شامل city_ids، map_state.camera_info (bbox + zoom + place_hash)،
- *   و search_data.form_data.data با bbox به صورت repeated_float به ترتیب:
- *   [min_longitude, min_latitude, max_longitude, max_latitude]
- * - پاسخ JSON معمولاً list_widgets با widget_type=POST_ROW دارد؛ token آگهی در
- *   data.action.payload.token یا data.token است.
- * - برای «تمام» آگهی‌های یک ناحیه، سرور در زوم کم جزئیات محدود می‌فرستد؛ این اسکریپت
- *   bbox را به صورت بازگشتی به ۴ زیرمستطیل تقسیم می‌کند (شبیه زوم بیشتر روی نقشه)،
- *   نتایج را با کلید token ادغام می‌کند و در یک فایل JSON ذخیره می‌کند.
- *
  * استفاده:
  *   php divar_map_collect.php initial_request.json output.json [گزینه‌ها]
  *
  * گزینه‌ها:
  *   --max-depth=N      عمق تقسیم بازگشتی (پیش‌فرض 5)
- *   --min-size-deg=X   حداقل اندازهٔ ضلع bbox به درجه؛ زیر این مقدار تقسیم متوقف می‌شود (پیش‌فرض 0.00025)
+ *   --min-size-deg=X   حداقل اندازهٔ ضلع bbox به درجه (پیش‌فرض 0.00025)
  *   --sleep-ms=N       فاصله بین درخواست‌ها به میلی‌ثانیه (پیش‌فرض 350)
  *   --zoom-step=X      افزایش zoom در هر سطح عمق (پیش‌فرض 0.35)
- *   --cookie-file=F    مسیر فایل حاوی هدر Cookie (اختیاری؛ برای جلسهٔ لاگین)
- *   --try-pagination   تلاش برای صفحه‌بندی با فیلدهای pagination برگشتی (آزمایشی؛ ممکن است API نیاز به شکل دیگری داشته باشد)
- *   --paginate-max=N   حداکثر صفحات اضافه در هر سلول در حالت --try-pagination (پیش‌فرض 30)
- *
- * محدودیت‌ها و هشدار حقوقی:
- * - استفادهٔ انبوه ممکن است با محدودیت‌های سرور یا شرایط استفادهٔ دیوار مغایرت داشته باشد.
- * - این ابزار صرفاً برای تحلیل فنی ساختار درخواست است؛ مسئولیت استفاده با خودتان است.
+ *   --cookie-file=F    فایل حاوی رشتهٔ Cookie (بدون پیشوند Cookie:)
+ *   --log-file=F       فایل لاگ جزئیات (پیش‌فرض: خروجی + .collect.log)
+ *   --no-log-file      بدون فایل لاگ
+ *   --quiet            بدون چاپ روی stderr (فقط فایل لاگ اگر فعال باشد)
+ *   --max-requests=N   حداکثر تعداد درخواست HTTP (ایمنی؛ پیش‌فرض 5000)
+ *   --timeout-sec=N    تایم‌اوت هر درخواست (پیش‌فرض 60)
+ *   --try-pagination   صفحه‌بندی آزمایشی با pagination پاسخ
+ *   --paginate-max=N   حداکثر صفحات اضافه در هر سلول (پیش‌فرض 30)
  */
 
 declare(strict_types=1);
 
 const DEFAULT_ENDPOINT = 'https://api.divar.ir/v8/postlist/w/search';
+
+/**
+ * کپی عمیق آرایه — بدون این، در PHP کپی سطحی است و bbox تمام شاخه‌های بازگشتی
+ * روی همان آرایهٔ تو در تو نوشته می‌شود و نتیجه غلط یا «گیر کرده» می‌شود.
+ *
+ * @param array<mixed> $data
+ * @return array<mixed>
+ */
+function deep_copy_array(array $data): array
+{
+    $j = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+    if ($j === false) {
+        throw new RuntimeException('deep_copy_array: json_encode ناموفق');
+    }
+    $copy = json_decode($j, true);
+    if (!is_array($copy)) {
+        throw new RuntimeException('deep_copy_array: json_decode ناموفق');
+    }
+    return $copy;
+}
+
+final class RunLogger
+{
+    private string $path;
+    private bool $quiet;
+
+    public function __construct(string $path, bool $quiet)
+    {
+        $this->path = $path;
+        $this->quiet = $quiet;
+        $dir = dirname($path);
+        if ($dir !== '' && $dir !== '.' && !is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+    }
+
+    /**
+     * @param array<string, mixed>|null $context
+     */
+    public function line(string $level, string $message, ?array $context = null): void
+    {
+        $ts = gmdate('Y-m-d\TH:i:s.v\Z');
+        $line = "[{$ts}] [{$level}] {$message}";
+        if ($context !== null && $context !== []) {
+            $line .= ' ' . json_encode($context, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        }
+        $line .= "\n";
+        @file_put_contents($this->path, $line, FILE_APPEND | LOCK_EX);
+        if (!$this->quiet) {
+            fwrite(STDERR, $line);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $body
+     * @param array<string, string> $headers
+     */
+    public function logHttpRequest(int $rid, string $method, string $url, array $headers, array $body): void
+    {
+        $safeHeaders = $headers;
+        if (isset($safeHeaders['cookie'])) {
+            $c = $safeHeaders['cookie'];
+            $safeHeaders['cookie'] = strlen($c) > 80 ? substr($c, 0, 40) . '…(' . strlen($c) . ' bytes)' : $c;
+        }
+        $this->line('HTTP_REQ', "rid={$rid} {$method} {$url}", [
+            'headers' => $safeHeaders,
+            'body' => $body,
+            'body_json_bytes' => strlen((string) json_encode($body, JSON_UNESCAPED_UNICODE)),
+        ]);
+    }
+
+    /**
+     * @param array<string, mixed>|null $json
+     */
+    public function logHttpResponse(
+        int $rid,
+        int $status,
+        string $statusLine,
+        array $respHeaders,
+        string $raw,
+        ?array $json,
+        float $elapsedMs
+    ): void {
+        $summary = null;
+        if (is_array($json)) {
+            $lw = $json['list_widgets'] ?? null;
+            $postRows = 0;
+            if (is_array($lw)) {
+                foreach ($lw as $w) {
+                    if (is_array($w) && ($w['widget_type'] ?? '') === 'POST_ROW') {
+                        $postRows++;
+                    }
+                }
+            }
+            $summary = [
+                'list_widgets_count' => is_array($lw) ? count($lw) : 0,
+                'post_row_widgets' => $postRows,
+                'pagination_has_next' => $json['pagination']['has_next_page'] ?? null,
+                'search_uid' => $json['pagination']['data']['search_uid'] ?? ($json['action_log']['server_side_info']['info']['search_uid'] ?? null),
+                'keys_top' => array_slice(array_keys($json), 0, 25),
+            ];
+        }
+        $rawPreview = strlen($raw) > 8000 ? substr($raw, 0, 8000) . "\n… trimmed " . strlen($raw) . " bytes" : $raw;
+        $this->line('HTTP_RES', "rid={$rid} status={$status} time_ms=" . round($elapsedMs, 2), [
+            'status_line' => $statusLine,
+            'response_headers' => $respHeaders,
+            'summary' => $summary,
+            'raw_body' => $rawPreview,
+            'decoded_json' => $json,
+        ]);
+    }
+
+    public function logEvent(string $event, array $data = []): void
+    {
+        $this->line('EVENT', $event, $data);
+    }
+}
 
 /** @return array<string, string> */
 function default_headers(): array
@@ -43,23 +151,147 @@ function default_headers(): array
         'content-type' => 'application/json',
         'origin' => 'https://divar.ir',
         'referer' => 'https://divar.ir/',
-        'user-agent' => 'Mozilla/5.0 (compatible; DivarMapCollector/1.0; +https://divar.ir)',
+        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'x-render-type' => 'CSR',
         'x-standard-divar-error' => 'true',
     ];
 }
 
-function http_post_json(string $url, array $body, array $extraHeaders = [], int $timeoutSec = 60): array
-{
+/**
+ * @param array<string, string> $extraHeaders
+ * @return array{json: array<string, mixed>|null, raw: string, status: int, status_line: string, response_headers: array<int|string, mixed>}
+ */
+function http_post_json(
+    string $url,
+    array $body,
+    array $extraHeaders,
+    int $timeoutSec,
+    ?RunLogger $logger,
+    int $requestId
+): array {
+    $t0 = microtime(true);
     $payload = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
     if ($payload === false) {
         throw new RuntimeException('json_encode بدنهٔ درخواست ناموفق بود.');
     }
 
+    $allHeaders = array_merge(default_headers(), $extraHeaders);
+
+    if ($logger !== null) {
+        $logger->logHttpRequest($requestId, 'POST', $url, $allHeaders, $body);
+    }
+
+    if (extension_loaded('curl')) {
+        return http_post_json_curl($url, $payload, $allHeaders, $timeoutSec, $logger, $requestId, $t0);
+    }
+
+    return http_post_json_stream($url, $payload, $allHeaders, $timeoutSec, $logger, $requestId, $t0);
+}
+
+/**
+ * @param array<string, string> $allHeaders
+ * @return array{json: array<string, mixed>|null, raw: string, status: int, status_line: string, response_headers: array<int|string, mixed>}
+ */
+function http_post_json_curl(
+    string $url,
+    string $payload,
+    array $allHeaders,
+    int $timeoutSec,
+    ?RunLogger $logger,
+    int $requestId,
+    float $t0
+): array {
+    $ch = curl_init($url);
+    if ($ch === false) {
+        throw new RuntimeException('curl_init ناموفق');
+    }
+    $flat = [];
+    foreach ($allHeaders as $k => $v) {
+        $flat[] = $k . ': ' . $v;
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $payload,
+        CURLOPT_HTTPHEADER => $flat,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => $timeoutSec,
+        CURLOPT_CONNECTTIMEOUT => min(30, $timeoutSec),
+        CURLOPT_HEADER => true,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+    $full = curl_exec($ch);
+    if ($full === false) {
+        $err = curl_error($ch);
+        curl_close($ch);
+        throw new RuntimeException('cURL خطا: ' . $err);
+    }
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+
+    $rawHeaders = substr($full, 0, $headerSize);
+    $rawBody = substr($full, $headerSize);
+    $statusLine = '';
+    $respHeaders = [];
+    foreach (preg_split("/\r\n/", $rawHeaders) as $i => $line) {
+        if ($i === 0) {
+            $statusLine = $line;
+            continue;
+        }
+        if ($line === '' || !str_contains($line, ':')) {
+            continue;
+        }
+        [$hk, $hv] = explode(':', $line, 2);
+        $respHeaders[trim($hk)] = trim($hv);
+    }
+
+    $json = null;
+    $decoded = json_decode($rawBody, true);
+    if (is_array($decoded)) {
+        $json = $decoded;
+    }
+
+    $elapsed = (microtime(true) - $t0) * 1000.0;
+    if ($logger !== null) {
+        $logger->logHttpResponse($requestId, $status, $statusLine, $respHeaders, $rawBody, $json, $elapsed);
+    }
+
+    if ($status < 200 || $status >= 300) {
+        throw new RuntimeException('HTTP ' . $status . ' — پیش‌نمایش بدنه: ' . substr($rawBody, 0, 600));
+    }
+    if ($json === null) {
+        throw new RuntimeException('JSON پاسخ نامعتبر (آیا HTML یا خطای میانی است؟) پیش‌نمایش: ' . substr($rawBody, 0, 400));
+    }
+
+    return [
+        'json' => $json,
+        'raw' => $rawBody,
+        'status' => $status,
+        'status_line' => $statusLine,
+        'response_headers' => $respHeaders,
+    ];
+}
+
+/**
+ * @param array<string, string> $allHeaders
+ * @return array{json: array<string, mixed>|null, raw: string, status: int, status_line: string, response_headers: array<int|string, mixed>}
+ */
+function http_post_json_stream(
+    string $url,
+    string $payload,
+    array $allHeaders,
+    int $timeoutSec,
+    ?RunLogger $logger,
+    int $requestId,
+    float $t0
+): array {
     $headersFlat = [];
-    foreach (array_merge(default_headers(), $extraHeaders) as $k => $v) {
+    foreach ($allHeaders as $k => $v) {
         $headersFlat[] = $k . ': ' . $v;
     }
+
+    $prevTimeout = ini_get('default_socket_timeout');
+    ini_set('default_socket_timeout', (string) $timeoutSec);
 
     $ctx = stream_context_create([
         'http' => [
@@ -76,30 +308,59 @@ function http_post_json(string $url, array $body, array $extraHeaders = [], int 
     ]);
 
     $raw = @file_get_contents($url, false, $ctx);
+    ini_set('default_socket_timeout', (string) $prevTimeout);
+
     if ($raw === false) {
-        throw new RuntimeException('خطا در اتصال به ' . $url);
+        throw new RuntimeException('خطا در اتصال به ' . $url . ' (allow_url_fopen یا شبکه)');
     }
 
-    /** @var array<string, mixed>|null $meta */
-    $meta = $http_response_header ?? null;
-    $statusLine = is_array($meta) && isset($meta[0]) ? $meta[0] : '';
-    if (!preg_match('#\s(\d{3})\s#', $statusLine, $m)) {
-        throw new RuntimeException('پاسخ HTTP نامعتبر: ' . $statusLine);
-    }
-    $code = (int) $m[1];
-    if ($code < 200 || $code >= 300) {
-        throw new RuntimeException('HTTP ' . $code . ' — بدنه: ' . mb_substr($raw, 0, 500));
+    $meta = $http_response_header ?? [];
+    $statusLine = isset($meta[0]) ? (string) $meta[0] : '';
+    $status = 0;
+    if (preg_match('#\s(\d{3})\s#', $statusLine, $m)) {
+        $status = (int) $m[1];
     }
 
+    $respHeaders = [];
+    foreach ($meta as $i => $h) {
+        if ($i === 0) {
+            continue;
+        }
+        if (!str_contains((string) $h, ':')) {
+            continue;
+        }
+        [$hk, $hv] = explode(':', (string) $h, 2);
+        $respHeaders[trim($hk)] = trim($hv);
+    }
+
+    $json = null;
     $decoded = json_decode($raw, true);
-    if (!is_array($decoded)) {
-        throw new RuntimeException('JSON پاسخ نامعتبر است.');
+    if (is_array($decoded)) {
+        $json = $decoded;
     }
 
-    return ['json' => $decoded, 'raw' => $raw];
+    $elapsed = (microtime(true) - $t0) * 1000.0;
+    if ($logger !== null) {
+        $logger->logHttpResponse($requestId, $status, $statusLine, $respHeaders, $raw, $json, $elapsed);
+    }
+
+    if ($status < 200 || $status >= 300) {
+        throw new RuntimeException('HTTP ' . $status . ' — بدنه: ' . substr($raw, 0, 500));
+    }
+    if ($json === null) {
+        throw new RuntimeException('JSON پاسخ نامعتبر است. پیش‌نمایش: ' . substr($raw, 0, 400));
+    }
+
+    return [
+        'json' => $json,
+        'raw' => $raw,
+        'status' => $status,
+        'status_line' => $statusLine,
+        'response_headers' => $respHeaders,
+    ];
 }
 
-/** @param mixed $decoded */
+/** @param array<string, mixed> $decoded */
 function bbox_from_request_body(array $decoded): array
 {
     $map = $decoded['map_state']['camera_info']['bbox'] ?? null;
@@ -182,7 +443,7 @@ function set_zoom_in_body($body, float $zoom)
     return $body;
 }
 
-/** @return array<string, array<string, mixed>> token => خلاصهٔ آگهی */
+/** @return array<string, array<string, mixed>> */
 function extract_posts_from_list_widgets(?array $listWidgets): array
 {
     $out = [];
@@ -220,8 +481,6 @@ function extract_posts_from_list_widgets(?array $listWidgets): array
 }
 
 /**
- * ادغام نتایج صفحه‌بندی آزمایشی (در صورت پشتیبانی سرور).
- *
  * @param array<string, mixed> $baseBody
  * @return array<int, array<string, mixed>>
  */
@@ -230,8 +489,12 @@ function fetch_extra_pages(
     array $baseBody,
     array $firstResponse,
     array $extraHeaders,
+    int $timeoutSec,
     int $sleepUs,
-    int $paginateMax
+    int $paginateMax,
+    ?RunLogger $logger,
+    int &$globalRequestCount,
+    int $maxRequests
 ): array {
     $pages = [];
     $resp = $firstResponse;
@@ -245,7 +508,14 @@ function fetch_extra_pages(
             break;
         }
 
-        $nextBody = $baseBody;
+        if ($globalRequestCount >= $maxRequests) {
+            if ($logger !== null) {
+                $logger->logEvent('pagination_stopped_max_requests', ['at' => $globalRequestCount]);
+            }
+            break;
+        }
+
+        $nextBody = deep_copy_array($baseBody);
         $nextBody['pagination'] = [
             'has_next_page' => true,
             'data' => $pagData,
@@ -253,7 +523,8 @@ function fetch_extra_pages(
         ];
 
         usleep($sleepUs);
-        $got = http_post_json($url, $nextBody, $extraHeaders);
+        $globalRequestCount++;
+        $got = http_post_json($url, $nextBody, $extraHeaders, $timeoutSec, $logger, $globalRequestCount);
         $pages[] = $got['json'];
         $resp = $got['json'];
     }
@@ -281,53 +552,119 @@ function merge_responses_into(array &$accumPosts, array $extraResponses): void
 }
 
 /**
+ * @param array<string, mixed> $ctx
  * @param array<string, mixed> $accumPosts
  */
-function crawl_quad(
-    string $url,
-    array $templateBody,
-    float $baseZoom,
-    float $zoomStep,
-    float $minLon,
-    float $minLat,
-    float $maxLon,
-    float $maxLat,
-    int $depth,
-    int $maxDepth,
-    float $minSizeDeg,
-    array &$accumPosts,
-    array $extraHeaders,
-    int $sleepUs,
-    bool $tryPagination,
-    int $paginateMax
-): void {
+function crawl_quad(array &$ctx, array &$accumPosts): void
+{
+    $url = $ctx['url'];
+    /** @var array<string, mixed> $templateBody */
+    $templateBody = $ctx['templateBody'];
+    $baseZoom = $ctx['baseZoom'];
+    $zoomStep = $ctx['zoomStep'];
+    $minLon = $ctx['minLon'];
+    $minLat = $ctx['minLat'];
+    $maxLon = $ctx['maxLon'];
+    $maxLat = $ctx['maxLat'];
+    $depth = $ctx['depth'];
+    $maxDepth = $ctx['maxDepth'];
+    $minSizeDeg = $ctx['minSizeDeg'];
+    $extraHeaders = $ctx['extraHeaders'];
+    $sleepUs = $ctx['sleepUs'];
+    $tryPagination = $ctx['tryPagination'];
+    $paginateMax = $ctx['paginateMax'];
+    $logger = $ctx['logger'];
+    $timeoutSec = $ctx['timeoutSec'];
+    $maxRequests = $ctx['maxRequests'];
+
+    /** @var int $globalRequestCount */
+    $globalRequestCount = &$ctx['globalRequestCount'];
+
     $width = $maxLon - $minLon;
     $height = $maxLat - $minLat;
     if ($width <= 0 || $height <= 0) {
+        if ($logger !== null) {
+            $logger->logEvent('crawl_skip_invalid_bbox', ['depth' => $depth, 'minLon' => $minLon, 'minLat' => $minLat, 'maxLon' => $maxLon, 'maxLat' => $maxLat]);
+        }
         return;
     }
 
-    $body = $templateBody;
+    if ($globalRequestCount >= $maxRequests) {
+        if ($logger !== null) {
+            $logger->logEvent('crawl_skip_max_requests', ['depth' => $depth, 'count' => $globalRequestCount]);
+        }
+        return;
+    }
+
+    // مهم: deep copy تا مرزهای سلول را روی قالب مشترک بازنویسی نکنیم
+    $body = deep_copy_array($templateBody);
     $body = set_bbox_in_body($body, $minLon, $minLat, $maxLon, $maxLat);
     $body = set_zoom_in_body($body, min(19.0, $baseZoom + $depth * $zoomStep));
 
+    if ($logger !== null) {
+        $logger->logEvent('crawl_cell_begin', [
+            'depth' => $depth,
+            'bbox' => [$minLon, $minLat, $maxLon, $maxLat],
+            'zoom' => min(19.0, $baseZoom + $depth * $zoomStep),
+            'request_index_before' => $globalRequestCount,
+        ]);
+    }
+
     usleep($sleepUs);
-    $pack = http_post_json($url, $body, $extraHeaders);
+    $globalRequestCount++;
+    $pack = http_post_json($url, $body, $extraHeaders, $timeoutSec, $logger, $globalRequestCount);
     /** @var array<string, mixed> $json */
     $json = $pack['json'];
 
     $fromMain = extract_posts_from_list_widgets($json['list_widgets'] ?? null);
+    $beforeCount = count($accumPosts);
     foreach ($fromMain as $tok => $row) {
         $accumPosts[$tok] = $row;
     }
+    $added = count($accumPosts) - $beforeCount;
+
+    if ($logger !== null) {
+        $logger->logEvent('crawl_cell_after_main_request', [
+            'depth' => $depth,
+            'new_tokens_this_cell' => $added,
+            'total_unique_posts' => count($accumPosts),
+        ]);
+    }
 
     if ($tryPagination) {
-        $extras = fetch_extra_pages($url, $body, $json, $extraHeaders, $sleepUs, $paginateMax);
+        $extras = fetch_extra_pages(
+            $url,
+            $body,
+            $json,
+            $extraHeaders,
+            $timeoutSec,
+            $sleepUs,
+            $paginateMax,
+            $logger,
+            $globalRequestCount,
+            $maxRequests
+        );
         merge_responses_into($accumPosts, $extras);
+        if ($logger !== null) {
+            $logger->logEvent('crawl_cell_after_pagination', [
+                'depth' => $depth,
+                'extra_pages' => count($extras),
+                'total_unique_posts' => count($accumPosts),
+            ]);
+        }
     }
 
     $shouldSplit = $depth < $maxDepth && $width >= $minSizeDeg && $height >= $minSizeDeg;
     if (!$shouldSplit) {
+        if ($logger !== null) {
+            $logger->logEvent('crawl_cell_no_split', [
+                'depth' => $depth,
+                'reason' => $depth >= $maxDepth ? 'max_depth' : 'bbox_too_small',
+                'width' => $width,
+                'height' => $height,
+                'min_size_deg' => $minSizeDeg,
+            ]);
+        }
         return;
     }
 
@@ -341,25 +678,22 @@ function crawl_quad(
         [$midLon, $midLat, $maxLon, $maxLat],
     ];
 
-    foreach ($quads as [$w, $s, $e, $n]) {
-        crawl_quad(
-            $url,
-            $templateBody,
-            $baseZoom,
-            $zoomStep,
-            $w,
-            $s,
-            $e,
-            $n,
-            $depth + 1,
-            $maxDepth,
-            $minSizeDeg,
-            $accumPosts,
-            $extraHeaders,
-            $sleepUs,
-            $tryPagination,
-            $paginateMax
-        );
+    foreach ($quads as $qi => $q) {
+        [$w, $s, $e, $n] = $q;
+        $child = $ctx;
+        $child['minLon'] = $w;
+        $child['minLat'] = $s;
+        $child['maxLon'] = $e;
+        $child['maxLat'] = $n;
+        $child['depth'] = $depth + 1;
+        if ($logger !== null) {
+            $logger->logEvent('crawl_recurse_child', [
+                'parent_depth' => $depth,
+                'child_index' => $qi,
+                'child_bbox' => [$w, $s, $e, $n],
+            ]);
+        }
+        crawl_quad($child, $accumPosts);
     }
 }
 
@@ -375,7 +709,8 @@ function read_cookie_file(?string $path): array
     if ($c === '') {
         return [];
     }
-    return ['cookie' => $c];
+    $c = preg_replace('#^Cookie:\s*#i', '', $c);
+    return ['cookie' => $c !== null ? $c : ''];
 }
 
 /** @param array<int, string> $argv */
@@ -397,6 +732,11 @@ function main(array $argv): int
     $cookieFile = null;
     $tryPagination = false;
     $paginateMax = 30;
+    $logFile = null;
+    $noLogFile = false;
+    $quiet = false;
+    $maxRequests = 5000;
+    $timeoutSec = 60;
 
     foreach ($argv as $arg) {
         if (str_starts_with($arg, '--max-depth=')) {
@@ -413,6 +753,16 @@ function main(array $argv): int
             $tryPagination = true;
         } elseif (str_starts_with($arg, '--paginate-max=')) {
             $paginateMax = max(1, (int) substr($arg, strlen('--paginate-max=')));
+        } elseif (str_starts_with($arg, '--log-file=')) {
+            $logFile = substr($arg, strlen('--log-file='));
+        } elseif ($arg === '--no-log-file') {
+            $noLogFile = true;
+        } elseif ($arg === '--quiet') {
+            $quiet = true;
+        } elseif (str_starts_with($arg, '--max-requests=')) {
+            $maxRequests = max(1, (int) substr($arg, strlen('--max-requests=')));
+        } elseif (str_starts_with($arg, '--timeout-sec=')) {
+            $timeoutSec = max(5, (int) substr($arg, strlen('--timeout-sec=')));
         }
     }
 
@@ -446,32 +796,88 @@ function main(array $argv): int
     $accum = [];
     $url = DEFAULT_ENDPOINT;
 
-    fwrite(STDOUT, "شروع جمع‌آوری — bbox: [{$minLon}, {$minLat}, {$maxLon}, {$maxLat}] depth≤{$maxDepth}\n");
+    if (!$noLogFile && $logFile === null) {
+        $logFile = $outPath . '.collect.log';
+    }
 
-    crawl_quad(
-        $url,
-        $template,
-        $baseZoom,
-        $zoomStep,
-        $minLon,
-        $minLat,
-        $maxLon,
-        $maxLat,
-        0,
-        $maxDepth,
-        $minSizeDeg,
-        $accum,
-        $extraHeaders,
-        $sleepUs,
-        $tryPagination,
-        $paginateMax
-    );
+    $logger = null;
+    if (!$noLogFile && $logFile !== null) {
+        $logger = new RunLogger($logFile, $quiet);
+        $logger->logEvent('run_start', [
+            'input' => $inPath,
+            'output' => $outPath,
+            'bbox' => [$minLon, $minLat, $maxLon, $maxLat],
+            'max_depth' => $maxDepth,
+            'min_size_deg' => $minSizeDeg,
+            'sleep_ms' => $sleepMs,
+            'zoom_step' => $zoomStep,
+            'try_pagination' => $tryPagination,
+            'max_requests' => $maxRequests,
+            'timeout_sec' => $timeoutSec,
+            'curl_available' => extension_loaded('curl'),
+            'allow_url_fopen' => filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN),
+            'php_version' => PHP_VERSION,
+            'log_file' => $logFile,
+        ]);
+    } elseif ($quiet === false && $noLogFile) {
+        fwrite(STDERR, "[hint] لاگ فایل با --no-log-file خاموش است؛ برای ذخیرهٔ ریکوئست/ریسپانس هر مرحله آن را بردارید یا --log-file=PATH بدهید.\n");
+    }
+
+    // قالب پایه را یک بار عمیق کپی می‌کنیم تا حین کراول، JSON ورودی کاربر دست‌نخورده بماند
+    $templateImmutable = deep_copy_array($template);
+
+    $ctx = [
+        'url' => $url,
+        'templateBody' => $templateImmutable,
+        'baseZoom' => $baseZoom,
+        'zoomStep' => $zoomStep,
+        'minLon' => $minLon,
+        'minLat' => $minLat,
+        'maxLon' => $maxLon,
+        'maxLat' => $maxLat,
+        'depth' => 0,
+        'maxDepth' => $maxDepth,
+        'minSizeDeg' => $minSizeDeg,
+        'extraHeaders' => $extraHeaders,
+        'sleepUs' => $sleepUs,
+        'tryPagination' => $tryPagination,
+        'paginateMax' => $paginateMax,
+        'logger' => $logger,
+        'timeoutSec' => $timeoutSec,
+        'maxRequests' => $maxRequests,
+        'globalRequestCount' => 0,
+    ];
+
+    if (!$quiet) {
+        fwrite(STDERR, "شروع جمع‌آوری — bbox: [{$minLon}, {$minLat}, {$maxLon}, {$maxLat}] depth≤{$maxDepth}\n");
+        if ($logger !== null) {
+            fwrite(STDERR, "لاگ جزئیات: {$logFile}\n");
+        }
+    }
+
+    try {
+        crawl_quad($ctx, $accum);
+    } catch (Throwable $e) {
+        if ($logger !== null) {
+            $logger->logEvent('fatal_error', ['message' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+        }
+        fwrite(STDERR, 'خطا: ' . $e->getMessage() . "\n");
+        return 1;
+    }
+
+    if ($logger !== null) {
+        $logger->logEvent('run_end', [
+            'http_requests' => $ctx['globalRequestCount'],
+            'unique_posts' => count($accum),
+        ]);
+    }
 
     $export = [
         'meta' => [
             'endpoint' => $url,
             'bbox' => ['min_lon' => $minLon, 'min_lat' => $minLat, 'max_lon' => $maxLon, 'max_lat' => $maxLat],
             'unique_posts' => count($accum),
+            'http_requests' => $ctx['globalRequestCount'],
             'collected_at' => gmdate('c'),
         ],
         'tokens' => array_keys($accum),
@@ -489,7 +895,9 @@ function main(array $argv): int
         return 1;
     }
 
-    fwrite(STDOUT, 'تمام — تعداد آگهی یکتا: ' . count($accum) . " → {$outPath}\n");
+    if (!$quiet) {
+        fwrite(STDERR, 'تمام — درخواست‌ها: ' . $ctx['globalRequestCount'] . ' — آگهی یکتا: ' . count($accum) . " → {$outPath}\n");
+    }
     return 0;
 }
 
