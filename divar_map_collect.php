@@ -971,6 +971,7 @@ function main(array $argv): int
     if (($ctx['stop_reason'] ?? null) === null) {
         $ctx['stop_reason'] = 'complete';
     }
+    if ($logger !== null) {
         $logger->logEvent('run_end', [
             'http_requests' => $ctx['globalRequestCount'],
             'unique_posts' => count($accum),
