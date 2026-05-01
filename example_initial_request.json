@@ -1,0 +1,51 @@
+{
+  "city_ids": ["1763"],
+  "source_view": "MAP_DISCOVERY_MAP",
+  "disable_recommendation": false,
+  "map_state": {
+    "camera_info": {
+      "bbox": {
+        "min_latitude": 35.572843,
+        "min_longitude": 51.448234,
+        "max_latitude": 35.588327,
+        "max_longitude": 51.471025
+      },
+      "place_hash": "1763||residential-sell",
+      "zoom": 14.291575411627942
+    },
+    "page_state": "HALF_STATE"
+  },
+  "search_data": {
+    "form_data": {
+      "data": {
+        "bbox": {
+          "repeated_float": {
+            "value": [
+              { "value": 51.4469719 },
+              { "value": 35.5732727 },
+              { "value": 51.4697609 },
+              { "value": 35.5887566 }
+            ]
+          }
+        },
+        "category": {
+          "str": {
+            "value": "residential-sell"
+          }
+        }
+      }
+    },
+    "server_payload": {
+      "@type": "type.googleapis.com/widgets.SearchData.ServerPayload",
+      "additional_form_data": {
+        "data": {
+          "sort": {
+            "str": {
+              "value": "sort_date"
+            }
+          }
+        }
+      }
+    }
+  }
+}
